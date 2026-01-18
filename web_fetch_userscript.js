@@ -7,6 +7,9 @@
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
 // @connect      127.0.0.1
 // @connect      localhost
 // ==/UserScript==
@@ -42,21 +45,21 @@
 
     function startBridge() {
         createUI();
-        loopId = setInterval(checkJob, 2000); // Check every 2 seconds
+        setInterval(checkJob, 2000); // Check every 2 seconds
     }
 
     // --- UI HELPER ---
     function createUI() {
         if (ui) return;
         ui = document.createElement('div');
-        ui.style.cssText = "position:fixed; top:10px; right:10px; z-index:99999; background:rgba(0,0,0,0.8); color:white; padding:10px; border-radius:5px; font-family:sans-serif; font-size:12px; pointer-events:none; border: 1px solid #444;";
-        ui.innerHTML = "ComfyUI Bridge: <span style='color:#FFFF00'>Idle</span>";
+        ui.style.cssText = "position:fixed; top:10px; right:120px; z-index:99999; background:rgba(0,0,0,0.8); color:white; padding:10px; border-radius:5px; font-family:sans-serif; font-size:12px; pointer-events:none; border: 1px solid #444;";
+        ui.innerHTML = "ComfyUI: <span style='color:#AAAAAA'>Idle</span>";
         document.body.appendChild(ui);
     }
 
     function updateStatus(text, color) {
         if (!ui) createUI();
-        ui.innerHTML = `ComfyUI Bridge: <span style='color:${color}'>${text}</span>`;
+        ui.innerHTML = `ComfyUI: <span style='color:${color}'>${text}</span>`;
     }
 
     // --- NETWORK HELPER ---
@@ -76,15 +79,11 @@
                             resolve(response.responseText); // Fallback for non-json
                         }
                     } else {
-                        reject(new Error(`HTTP ${response.status}: ${response.statusText}`));
+                        reject(new Error(`HTTP ${response.status}`));
                     }
                 },
-                onerror: (err) => {
-                    reject(new Error("Network Error"));
-                },
-                ontimeout: () => {
-                    reject(new Error("Timeout"));
-                }
+                onerror: (err) => { reject(new Error("Network Error")); },
+                ontimeout: () => { reject(new Error("Timeout")); }
             });
         });
     }
@@ -98,60 +97,127 @@
             const data = await gmRequest(`${SERVER_URL}/job`);
 
             if (data.job) {
-                isProcessing = true;
-                updateStatus("Processing Job...", "#00FF00");
-                console.log("ComfyUI Job Received:", data.job);
+                isProcessing = true; // Local lock
                 await executeJob(data.job);
             } else {
                 updateStatus("Connected (Idle)", "#AAAAAA");
+                // Clear state if server says IDLE
+                if (GM_getValue('comfy_job_id')) {
+                    GM_deleteValue('comfy_job_id');
+                    GM_deleteValue('comfy_job_phase');
+                }
             }
         } catch (e) {
-            console.warn("ComfyUI Bridge Poll Error:", e);
-            updateStatus("Disconnected (Server Unreachable)", "#FF0000");
+            // console.warn("ComfyUI Bridge Poll Error:", e);
+            updateStatus("Disconnected", "#FF4444");
         }
     }
 
     async function executeJob(job) {
+        const storedId = GM_getValue('comfy_job_id');
+        let phase = GM_getValue('comfy_job_phase') || 'start';
+
+        // Check if this is a Resume or New Job
+        if (storedId === job.id) {
+            console.log(`Resuming Job ${job.id} at phase ${phase}`);
+            updateStatus(`Resuming (${phase})...`, "#00FF00");
+        } else {
+            console.log(`Starting New Job ${job.id}`);
+            GM_setValue('comfy_job_id', job.id);
+            GM_setValue('comfy_job_phase', 'start');
+            phase = 'start';
+        }
+
         try {
-            // 1. Find Prompt Box
-            let promptBox = findPromptBox(job.selectors);
-            if (!promptBox) throw new Error("Prompt box not found");
+            // PHASE 1: INPUT Prompt
+            if (phase === 'start') {
+                updateStatus("Type Prompt...", "#00FFFF");
 
-            // 2. Input Text
-            promptBox.focus();
-            promptBox.value = job.prompt;
-            promptBox.dispatchEvent(new Event('input', { bubbles: true }));
+                // 1. Find Prompt Box
+                let promptBox = findPromptBox(job.selectors);
+                if (!promptBox) {
+                    // Retry once after 2 seconds in case of slow load
+                    await sleep(2000);
+                    promptBox = findPromptBox(job.selectors);
+                    if (!promptBox) throw new Error("Prompt box not found");
+                }
 
-            if (promptBox.isContentEditable) {
-                promptBox.innerText = job.prompt;
+                // 2. Input Text
+                promptBox.focus();
+                promptBox.value = job.prompt;
+                promptBox.dispatchEvent(new Event('input', { bubbles: true }));
+
+                if (promptBox.isContentEditable) {
+                    promptBox.innerText = job.prompt;
+                }
+
+                // Update Phase
+                phase = 'generate';
+                GM_setValue('comfy_job_phase', phase);
+                await sleep(500);
             }
 
-            // Try to assume specific Gemini/ChatGPT structure handling if needed
-            // (e.g. clicking the 'send' icon inside the box)
+            // PHASE 2: CLICK Generate
+            if (phase === 'generate') {
+                updateStatus("Click Generate...", "#00FFFF");
 
-            await sleep(500);
+                // 3. Find & Click Generate
+                let btn = findGenerateButton(job.selectors);
+                if (!btn) {
+                    // Maybe it auto-submitted? Or button hidden?
+                    // We'll throw for now, but user could override via selectors if needed.
+                    throw new Error("Generate button not found");
+                }
 
-            // 3. Find & Click Generate
-            let btn = findGenerateButton(job.selectors);
-            if (!btn) throw new Error("Generate button not found");
+                btn.click();
 
-            const oldImages = getImgSrcs();
+                // Update Phase
+                phase = 'wait_result';
+                GM_setValue('comfy_job_phase', phase);
 
-            btn.click();
-            updateStatus("Generating...", "#00FFFF");
+                // Helper: Give the page a moment to react (or unload) before we start polling for images
+                await sleep(2000);
+            }
 
-            // 4. Wait for Result
-            let resultSrc = await waitForNewImage(oldImages, job.timeout || 60);
+            // PHASE 3: WAIT Result
+            if (phase === 'wait_result') {
+                updateStatus("Waiting for Image...", "#FFFF00");
 
-            // 5. Send Result
-            updateStatus("Uploading Result...", "#FFFF00");
-            await sendResult(resultSrc);
+                // We define 'oldImages' as whatever is currently on screen when we start waiting.
+                // If the page reloaded, this is fine because the process of 'appearing' usually involves DOM insertion.
+                // If the result yielded immediately on reload, we might miss it if we rely strictly on "diff". 
+                // But generally userscript runs "load" -> "poll" -> "exec", by then images are DOM present.
+                const currentImages = getImgSrcs();
 
-            updateStatus("Done!", "#00FF00");
+                // 4. Wait
+                let resultSrc = await waitForNewImage(currentImages, job.timeout || 60);
+
+                // 5. Send Result
+                updateStatus("Uploading...", "#00FF00");
+                await sendResult(resultSrc);
+
+                // Cleanup
+                GM_deleteValue('comfy_job_id');
+                GM_deleteValue('comfy_job_phase');
+                updateStatus("Done!", "#00FF00");
+            }
+
         } catch (e) {
             console.error(e);
             updateStatus("Error: " + e.message, "#FF0000");
-            gmRequest(`${SERVER_URL}/result`, 'POST', { error: e.message }).catch(err => console.error("Failed to report error", err));
+
+            // Only report error to server if we are sure it's fatal
+            // e.g. Prompt box missing on start.
+            // If we are in wait state and something odd happens, maybe we shouldn't kill the server job immediately?
+            // For now, fail fast is safer.
+
+            // Wait a bit before reporting error, to avoid spamming if it's transient
+            await sleep(1000);
+            gmRequest(`${SERVER_URL}/result`, 'POST', { error: e.message }).catch(err => { });
+
+            // Clear local state so next poll doesn't infinite loop error
+            GM_deleteValue('comfy_job_id');
+            GM_deleteValue('comfy_job_phase');
         } finally {
             isProcessing = false;
         }
@@ -237,7 +303,11 @@
     }
 
     async function sendResult(src) {
+        // Convert to base64
+        console.log(`[ComfyBridge] Converting ${src} to DataURL...`);
         const dataUrl = await toDataURL(src);
+        console.log(`[ComfyBridge] DataURL generated. Length: ${dataUrl.length}. Header: ${dataUrl.substring(0, 50)}...`);
+
         await gmRequest(`${SERVER_URL}/result`, 'POST', { image: dataUrl });
     }
 

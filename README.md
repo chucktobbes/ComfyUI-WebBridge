@@ -1,5 +1,7 @@
 # ComfyUI Web Bridge
 
+# Work in progress !!!!!!
+
 This custom node allows ComfyUI to interact with ANY website open in your browser via a lightweight Userscript bridge. It acts as a "glue" between ComfyUI and your browser.
 
 ## Features

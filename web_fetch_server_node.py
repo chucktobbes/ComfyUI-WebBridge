@@ -45,28 +45,51 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/result':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            
             try:
-                # Expecting JSON with base64 image or raw bytes?
-                # Let's do JSON for metadata support
+                content_length = int(self.headers.get('Content-Length', 0))
+                print(f"[WebBridge] Receiving POST /result. Size: {content_length} bytes")
+                
+                if content_length == 0:
+                     raise Exception("Empty request body")
+
+                post_data = self.rfile.read(content_length)
                 data = json.loads(post_data.decode('utf-8'))
                 
                 if "error" in data:
+                     print(f"[WebBridge] Client reported error: {data['error']}")
                      SERVER_STATE["last_error"] = data["error"]
                      SERVER_STATE["result"] = None
                 elif "image" in data:
-                    # Base64 decoded
-                    img_data = base64.b64decode(data["image"].split(",")[1]) # Remove data:image/png;base64, header
+                    b64_str = data["image"]
+                    print(f"[WebBridge] Received image data. Length: {len(b64_str)}")
+                    
+                    if "," in b64_str:
+                        header, encoded = b64_str.split(",", 1)
+                        print(f"[WebBridge] Image header: {header}")
+                    else:
+                        encoded = b64_str
+                        print(f"[WebBridge] No header found in base64 string.")
+
+                    img_data = base64.b64decode(encoded)
                     img = Image.open(BytesIO(img_data))
+                    
+                    # Force verify image
+                    img.verify() 
+                    img = Image.open(BytesIO(img_data)) # Re-open after verify
+                    
                     SERVER_STATE["result"] = img
+                    print("[WebBridge] Image decoded successfully.")
                 
                 SERVER_STATE["event"].set()
                 self._set_headers()
                 self.wfile.write(json.dumps({"status": "received"}).encode('utf-8'))
+                
             except Exception as e:
-                print(f"Error parsing result: {e}")
+                print(f"[WebBridge] Error processing POST: {e}")
+                SERVER_STATE["last_error"] = str(e)
+                # Still set event to wake up node and show error
+                SERVER_STATE["event"].set() 
+                
                 self._set_headers(400)
                 self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
         else:
