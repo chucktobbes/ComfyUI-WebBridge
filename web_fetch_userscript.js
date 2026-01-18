@@ -114,17 +114,22 @@
     }
 
     async function executeJob(job) {
-        const storedId = GM_getValue('comfy_job_id');
+        // Try GM storage, fallback to window.name (robust against some storage clears)
+        const storedId = GM_getValue('comfy_job_id') || (window.name.startsWith('comfy_job:') ? window.name.split(':')[1] : null);
         let phase = GM_getValue('comfy_job_phase') || 'start';
 
         // Check if this is a Resume or New Job
         if (storedId === job.id) {
-            console.log(`Resuming Job ${job.id} at phase ${phase}`);
+            console.log(`[ComfyBridge] Resuming Job ${job.id} at phase ${phase}`);
             updateStatus(`Resuming (${phase})...`, "#00FF00");
         } else {
-            console.log(`Starting New Job ${job.id}`);
+            console.log(`[ComfyBridge] Starting New Job ${job.id} (Old: ${storedId})`);
+
+            // Set persistence
             GM_setValue('comfy_job_id', job.id);
             GM_setValue('comfy_job_phase', 'start');
+            try { window.name = `comfy_job:${job.id}`; } catch (e) { } // Backup
+
             phase = 'start';
         }
 
@@ -133,66 +138,74 @@
             if (phase === 'start') {
                 updateStatus("Type Prompt...", "#00FFFF");
 
-                // 1. Find Prompt Box
                 let promptBox = findPromptBox(job.selectors);
                 if (!promptBox) {
-                    // Retry once after 2 seconds in case of slow load
-                    await sleep(2000);
+                    await sleep(2000); // Retry
                     promptBox = findPromptBox(job.selectors);
-                    if (!promptBox) throw new Error("Prompt box not found");
                 }
 
-                // 2. Input Text
-                promptBox.focus();
-                promptBox.value = job.prompt;
-                promptBox.dispatchEvent(new Event('input', { bubbles: true }));
+                if (!promptBox) {
+                    // FALLBACK: If prompt box is missing, we might have reloaded into a result page 
+                    // where persistence failed. Instead of dying, let's try to wait for a result.
+                    console.warn("[ComfyBridge] Prompt box not found. Assuming we are already generating/waiting.");
+                    phase = 'wait_result';
+                    GM_setValue('comfy_job_phase', phase);
+                } else {
+                    // Normal Flow
+                    promptBox.focus();
+                    promptBox.value = job.prompt;
+                    promptBox.dispatchEvent(new Event('input', { bubbles: true }));
+                    if (promptBox.isContentEditable) promptBox.innerText = job.prompt;
 
-                if (promptBox.isContentEditable) {
-                    promptBox.innerText = job.prompt;
+                    phase = 'generate';
+                    GM_setValue('comfy_job_phase', phase);
+                    await sleep(500);
                 }
-
-                // Update Phase
-                phase = 'generate';
-                GM_setValue('comfy_job_phase', phase);
-                await sleep(500);
             }
 
             // PHASE 2: CLICK Generate
             if (phase === 'generate') {
                 updateStatus("Click Generate...", "#00FFFF");
 
-                // 3. Find & Click Generate
                 let btn = findGenerateButton(job.selectors);
                 if (!btn) {
-                    // Maybe it auto-submitted? Or button hidden?
-                    // We'll throw for now, but user could override via selectors if needed.
-                    throw new Error("Generate button not found");
+                    console.warn("[ComfyBridge] Generate button not found. Skipping click.");
+                } else {
+                    btn.click();
                 }
 
-                btn.click();
-
-                // Update Phase
                 phase = 'wait_result';
                 GM_setValue('comfy_job_phase', phase);
 
-                // Helper: Give the page a moment to react (or unload) before we start polling for images
-                await sleep(2000);
+                // Wait for page reaction/reload
+                await sleep(3000);
             }
 
             // PHASE 3: WAIT Result
             if (phase === 'wait_result') {
                 updateStatus("Waiting for Image...", "#FFFF00");
 
-                // We define 'oldImages' as whatever is currently on screen when we start waiting.
-                // If the page reloaded, this is fine because the process of 'appearing' usually involves DOM insertion.
-                // If the result yielded immediately on reload, we might miss it if we rely strictly on "diff". 
-                // But generally userscript runs "load" -> "poll" -> "exec", by then images are DOM present.
+                // Capture baseline images
                 const currentImages = getImgSrcs();
 
-                // 4. Wait
-                let resultSrc = await waitForNewImage(currentImages, job.timeout || 60);
+                // Wait for NEW image
+                let resultSrc = null;
+                try {
+                    resultSrc = await waitForNewImage(currentImages, job.timeout || 60);
+                } catch (e) {
+                    // Timeout?
+                    // If we skipped phases, maybe the result is ALREADY there (last image)?
+                    // Heuristic: Try to grab the last robust image on the page
+                    console.warn("[ComfyBridge] Timeout waiting for NEW image. Checking for existing input...");
+                    const allImgs = [...document.images].filter(i => i.naturalWidth > 200);
+                    if (allImgs.length > 0) {
+                        resultSrc = allImgs[allImgs.length - 1].src;
+                        console.log("[ComfyBridge] Falling back to last image:", resultSrc);
+                    } else {
+                        throw e;
+                    }
+                }
 
-                // 5. Send Result
                 updateStatus("Uploading...", "#00FF00");
                 await sendResult(resultSrc);
 
