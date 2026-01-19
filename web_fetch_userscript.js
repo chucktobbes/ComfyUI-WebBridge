@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ComfyUI Web Fetch Bridge
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @description  Connects any website to ComfyUI WebFetch Node
 // @author       You
 // @match        *://*/*
@@ -18,37 +18,37 @@
     'use strict';
 
     const SERVER_URL = "http://127.0.0.1:9955";
-    const DISABLED_KEY = 'comfyui_bridge_disabled';
+    // --- MENU COMMANDS ---
+    const ENABLED_KEY = 'comfyui_bridge_enabled';
+    const isEnabled = localStorage.getItem(ENABLED_KEY) === 'true';
 
     // Config Storage Keys (Per Site)
     const HOST = window.location.hostname;
     const CFG_PROMPT = `cfg_${HOST}_prompt`;
     const CFG_BTN = `cfg_${HOST}_btn`;
     const CFG_TEXT_OUTPUT = `cfg_${HOST}_text_output`;
+    const CFG_UPLOAD = `cfg_${HOST}_upload_target`;
 
     let isProcessing = false;
     let ui = null;
     let uiPanel = null;
-    let selectionMode = null; // 'prompt' | 'button' | 'text' | null
+    let selectionMode = null;
     let lastHovered = null;
 
-    // --- MENU COMMANDS ---
-    const isDisabled = localStorage.getItem(DISABLED_KEY) === 'true';
-
-    if (!isDisabled) {
+    if (isEnabled) {
         GM_registerMenuCommand("🔴 Disable Bridge on this Site", () => {
             if (confirm("Disable ComfyUI Bridge for this site?")) {
-                localStorage.setItem(DISABLED_KEY, 'true');
+                localStorage.removeItem(ENABLED_KEY);
                 location.reload();
             }
         });
         startBridge();
     } else {
         GM_registerMenuCommand("🟢 Enable Bridge on this Site", () => {
-            localStorage.removeItem(DISABLED_KEY);
+            localStorage.setItem(ENABLED_KEY, 'true');
             location.reload();
         });
-        console.log("ComfyUI Bridge is installed but disabled on this site.");
+        console.log("ComfyUI Bridge is installed but disabled by default. Use the Tampermonkey menu to enable it for this site.");
         return;
     }
 
@@ -132,6 +132,7 @@
         uiPanel.appendChild(createRow("Prompt Input", CFG_PROMPT, 'prompt'));
         uiPanel.appendChild(createRow("Generate Button", CFG_BTN, 'button'));
         uiPanel.appendChild(createRow("Text Output Area", CFG_TEXT_OUTPUT, 'text'));
+        uiPanel.appendChild(createRow("Image Upload Target", CFG_UPLOAD, 'upload'));
 
         // Close / Help
         const footer = document.createElement('div');
@@ -155,6 +156,7 @@
         const pVal = GM_getValue(CFG_PROMPT);
         const bVal = GM_getValue(CFG_BTN);
         const tVal = GM_getValue(CFG_TEXT_OUTPUT);
+        const uVal = GM_getValue(CFG_UPLOAD);
 
         const updateLbl = (type, val) => {
             const el = document.getElementById(`c-val-${type}`);
@@ -167,6 +169,7 @@
         updateLbl('prompt', pVal);
         updateLbl('button', bVal);
         updateLbl('text', tVal);
+        updateLbl('upload', uVal);
     }
 
     function updateStatus(text, color) {
@@ -186,6 +189,7 @@
         if (type === 'prompt') label = "Input Box";
         if (type === 'button') label = "Generate Button";
         if (type === 'text') label = "Text Output Container";
+        if (type === 'upload') label = "Upload Drop Zone / Button";
 
         updateStatus(`Select ${label}...`, "#00BFFF");
 
@@ -244,6 +248,7 @@
         if (selectionMode === 'prompt') key = CFG_PROMPT;
         else if (selectionMode === 'button') key = CFG_BTN;
         else if (selectionMode === 'text') key = CFG_TEXT_OUTPUT;
+        else if (selectionMode === 'upload') key = CFG_UPLOAD;
 
         GM_setValue(key, selector);
         console.log(`[ComfyBridge] Saved selector for ${selectionMode}:`, selector);
@@ -349,10 +354,24 @@
         }
 
         try {
-            // PHASE 1: INPUT Prompt
+            // PHASE 1: INPUT (Image + Prompt)
             if (phase === 'start') {
-                updateStatus("Type Prompt...", "#00FFFF");
+                updateStatus("Preparing Input...", "#00FFFF");
 
+                // 1.1 Upload Image if present
+                if (job.input_image) {
+                    updateStatus("Uploading Image...", "#00FFFF");
+                    const uploadTarget = findUploadTarget();
+                    if (uploadTarget) {
+                        await uploadImage(uploadTarget, job.input_image);
+                        await sleep(2000); // Wait for upload to process
+                    } else {
+                        console.warn("[ComfyBridge] No upload target found. Skipping image upload.");
+                    }
+                }
+
+                // 1.2 Type Prompt
+                updateStatus("Type Prompt...", "#00FFFF");
                 let promptBox = findPromptBox(job.selectors);
                 if (!promptBox) {
                     await sleep(2000);
@@ -369,7 +388,6 @@
                     promptBox.dispatchEvent(new Event('input', { bubbles: true }));
                     if (promptBox.getAttribute('contenteditable') === 'true') {
                         promptBox.innerText = job.prompt;
-                        // Some complex editors need more events
                         promptBox.dispatchEvent(new Event('change', { bubbles: true }));
                     }
 
@@ -442,7 +460,60 @@
         }
     }
 
+    // --- UPLOAD HELPER ---
+    async function uploadImage(target, base64Data) {
+        try {
+            // Convert base64 to Blob
+            const res = await fetch(base64Data);
+            const blob = await res.blob();
+            const file = new File([blob], "image.png", { type: "image/png" });
+
+            // Create DataTransfer
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            const fileList = dt.files;
+
+            // Method 1: Simulate PASTE (Best for Chat UI)
+            const pasteEvent = new ClipboardEvent('paste', {
+                bubbles: true,
+                cancelable: true,
+                clipboardData: dt
+            });
+            target.dispatchEvent(pasteEvent);
+
+            // Method 2: Simulate DROP (Best for Dropzones)
+            const dropEvent = new DragEvent('drop', {
+                bubbles: true,
+                cancelable: true,
+                dataTransfer: dt
+            });
+            target.dispatchEvent(dropEvent);
+
+            // Method 3: If target is input[type=file], we can't set files directly safely,
+            // but if the user selected the PARENT label or wrapper, the drop event often propagates.
+
+            console.log("[ComfyBridge] Dispatched Paste/Drop events for image upload.");
+
+        } catch (e) {
+            console.error("[ComfyBridge] Upload failed:", e);
+        }
+    }
+
     // --- FINDERS ---
+
+    function findUploadTarget() {
+        // 1. User Custom
+        const custom = GM_getValue(CFG_UPLOAD);
+        if (custom) {
+            try {
+                const el = document.querySelector(custom);
+                if (el) return el;
+            } catch (e) { console.warn("Invalid custom selection for upload", custom); }
+        }
+
+        // 2. Heuristic: Fallback to Prompt Box (Paste usually works there)
+        return findPromptBox(null);
+    }
 
     function findPromptBox(serverSelectors) {
         // 1. User Custom
@@ -536,8 +607,6 @@
     }
 
     async function waitForText(timeoutSecs) {
-        // If user defined a text container, use it. Otherwise, assume full body scan logic (risky)
-        // or look for the "last" message bubble.
         const custom = GM_getValue(CFG_TEXT_OUTPUT);
         let container = custom ? document.querySelector(custom) : document.body;
 
@@ -549,30 +618,23 @@
         let stableCount = 0;
         const start = Date.now();
 
-        // Heuristic: Wait until text changes, then wait until it STOPS changing.
         let hasStarted = false;
 
         while ((Date.now() - start) < timeoutSecs * 1000) {
             const currentText = container.innerText;
 
             if (currentText.length !== lastText.length) {
-                // It's changing!
                 hasStarted = true;
                 lastText = currentText;
                 stableCount = 0;
             } else {
                 if (hasStarted) {
                     stableCount++;
-                    // If stable for 2 seconds (4 x 500ms), assume done
                     if (stableCount >= 4) {
                         return lastText;
                     }
                 } else {
-                    // If we haven't seen a change yet, maybe it's just slow to start?
-                    // Or maybe the container is ALREADY holding the answer?
-                    // For now, let's wait at least 5 seconds before giving up on "starting"
                     if ((Date.now() - start) > 5000 && currentText.length > 50) {
-                        // Assume it was already there (instant response)
                         return currentText;
                     }
                 }
@@ -580,8 +642,7 @@
             await sleep(500);
         }
 
-        // Timeout
-        if (hasStarted) return lastText; // Return whatever we got
+        if (hasStarted) return lastText;
         throw new Error("Timeout waiting for text generation");
     }
 

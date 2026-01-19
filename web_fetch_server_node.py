@@ -3,6 +3,7 @@ import time
 import json
 import base64
 import socket
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 import torch
@@ -123,6 +124,7 @@ class WebFetchServerNode:
                 "prompt": ("STRING", {"multiline": True, "dynamicPrompts": False}),
             },
             "optional": {
+                "input_image": ("IMAGE",),
                 "timeout": ("INT", {"default": 60, "min": 5, "max": 600}),
                 "selector_override_json": ("STRING", {"default": "{}", "multiline": True}),
             }
@@ -133,37 +135,58 @@ class WebFetchServerNode:
     FUNCTION = "process"
     CATEGORY = "WebFetch"
 
-    def process(self, mode, prompt, timeout=60, selector_override_json="{}"):
+    def process(self, mode, prompt, input_image=None, timeout=60, selector_override_json="{}"):
         # 1. Reset State
         SERVER_STATE["event"].clear()
         SERVER_STATE["result"] = None
         SERVER_STATE["last_error"] = None
         
-        # 2. Post Job
+        # 2. Build Selectors from JSON Override
+        selectors = {}
         try:
-             selectors = json.loads(selector_override_json)
+             overrides = json.loads(selector_override_json)
+             if overrides:
+                 selectors.update(overrides)
         except:
-             selectors = {}
-             
+             pass
+        
+        # 3. Prepare Image Payload
+        input_image_b64 = None
+        if input_image is not None:
+            try:
+                # input_image is [B, H, W, C]
+                img_tensor = input_image[0]
+                i = 255. * img_tensor.cpu().numpy()
+                img_pil = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+                
+                buff = BytesIO()
+                img_pil.save(buff, format="PNG")
+                input_image_b64 = "data:image/png;base64," + base64.b64encode(buff.getvalue()).decode('utf-8')
+                print("[WebBridge] Processed input image for upload.")
+            except Exception as e:
+                print(f"[WebBridge] Error processing input image: {e}")
+
+        # 4. Post Job
         SERVER_STATE["job"] = {
             "id": str(time.time()),
             "mode": mode.lower(),
             "prompt": prompt,
             "timeout": timeout,
-            "selectors": selectors
+            "selectors": selectors,
+            "input_image": input_image_b64
         }
         SERVER_STATE["status"] = "waiting_for_browser"
         
         print(f"Job posted ({mode}). Waiting for browser to fetch from http://localhost:{PORT}...")
         
-        # 3. Wait
+        # 5. Wait
         start_time = time.time()
         while time.time() - start_time < timeout:
             if SERVER_STATE["event"].is_set():
                 break
             time.sleep(0.5)
             
-        # 4. Process Result
+        # 6. Process Result
         SERVER_STATE["job"] = None # Clear job
         SERVER_STATE["status"] = "idle"
         
@@ -173,7 +196,7 @@ class WebFetchServerNode:
         if SERVER_STATE["result"] is None:
             raise Exception("Timeout: Browser did not send a result in time. Make sure the Userscript is running.")
             
-        # 5. Return based on Type
+        # 7. Return based on Type
         res_type = SERVER_STATE["result"].get("type")
         res_data = SERVER_STATE["result"].get("data")
         
