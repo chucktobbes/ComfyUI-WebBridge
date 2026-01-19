@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ComfyUI Web Fetch Bridge
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Connects any website to ComfyUI WebFetch Node
 // @author       You
 // @match        *://*/*
@@ -18,49 +18,259 @@
     'use strict';
 
     const SERVER_URL = "http://127.0.0.1:9955";
-    const STORAGE_KEY = 'comfyui_bridge_enabled';
+    const DISABLED_KEY = 'comfyui_bridge_disabled';
+
+    // Config Storage Keys (Per Site)
+    const HOST = window.location.hostname;
+    const CFG_PROMPT = `cfg_${HOST}_prompt`;
+    const CFG_BTN = `cfg_${HOST}_btn`;
+
     let isProcessing = false;
     let ui = null;
-    let loopId = null;
+    let uiPanel = null;
+    let selectionMode = null; // 'prompt' | 'button' | null
+    let lastHovered = null;
 
     // --- MENU COMMANDS ---
-    // Toggle functionality per domain
-    const isEnabled = localStorage.getItem(STORAGE_KEY) === 'true';
+    const isDisabled = localStorage.getItem(DISABLED_KEY) === 'true';
 
-    if (isEnabled) {
+    if (!isDisabled) {
         GM_registerMenuCommand("🔴 Disable Bridge on this Site", () => {
             if (confirm("Disable ComfyUI Bridge for this site?")) {
-                localStorage.removeItem(STORAGE_KEY);
+                localStorage.setItem(DISABLED_KEY, 'true');
                 location.reload();
             }
         });
         startBridge();
     } else {
         GM_registerMenuCommand("🟢 Enable Bridge on this Site", () => {
-            localStorage.setItem(STORAGE_KEY, 'true');
+            localStorage.removeItem(DISABLED_KEY);
             location.reload();
         });
-        console.log("ComfyUI Bridge is installed but disabled on this site. Use the Tampermonkey menu to enable it.");
+        console.log("ComfyUI Bridge is installed but disabled on this site.");
+        return;
     }
 
     function startBridge() {
         createUI();
-        setInterval(checkJob, 2000); // Check every 2 seconds
+        setInterval(checkJob, 2000);
     }
 
     // --- UI HELPER ---
     function createUI() {
         if (ui) return;
+
+        // Container
         ui = document.createElement('div');
-        ui.style.cssText = "position:fixed; top:10px; right:120px; z-index:99999; background:rgba(0,0,0,0.8); color:white; padding:10px; border-radius:5px; font-family:sans-serif; font-size:12px; pointer-events:none; border: 1px solid #444;";
-        ui.innerHTML = "ComfyUI: <span style='color:#AAAAAA'>Idle</span>";
+        ui.style.cssText = "position:fixed; top:10px; right:10px; z-index:999999; font-family:sans-serif; font-size:12px; pointer-events:auto;";
+
+        // Status Bar
+        const statusBar = document.createElement('div');
+        statusBar.style.cssText = "background:rgba(0,0,0,0.85); color:white; padding:8px 12px; border-radius:6px; border: 1px solid #444; display:flex; align-items:center; gap:10px; cursor:default; box-shadow:0 4px 6px rgba(0,0,0,0.3);";
+
+        const statusText = document.createElement('span');
+        statusText.innerHTML = "ComfyUI: <span id='c-status' style='color:#AAAAAA; font-weight:bold;'>Idle</span>";
+
+        const settingsBtn = document.createElement('div');
+        settingsBtn.innerText = "⚙️";
+        settingsBtn.style.cssText = "cursor:pointer; opacity:0.7; font-size:14px;";
+        settingsBtn.onclick = toggleSettings;
+        settingsBtn.onmouseover = () => settingsBtn.style.opacity = '1';
+        settingsBtn.onmouseout = () => settingsBtn.style.opacity = '0.7';
+
+        statusBar.appendChild(statusText);
+        statusBar.appendChild(settingsBtn);
+        ui.appendChild(statusBar);
+
+        // Settings Panel
+        uiPanel = document.createElement('div');
+        uiPanel.style.cssText = "display:none; margin-top:5px; background:rgba(0,0,0,0.9); padding:10px; border-radius:6px; border:1px solid #555; color:#eee; min-width:220px; flex-direction:column; gap:8px;";
+
+        // Helper to create rows
+        const createRow = (label, key, type) => {
+            const row = document.createElement('div');
+            row.style.cssText = "display:flex; flex-direction:column; gap:4px;";
+
+            const lbl = document.createElement('div');
+            lbl.innerText = label;
+            lbl.style.color = '#ccc';
+            lbl.style.fontSize = '10px';
+
+            const controls = document.createElement('div');
+            controls.style.display = 'flex';
+            controls.style.gap = '5px';
+
+            const selBtn = document.createElement('button');
+            selBtn.innerText = "🎯 Select";
+            selBtn.style.cssText = "flex:1; background:#333; border:1px solid #555; color:white; border-radius:3px; cursor:pointer;";
+            selBtn.onclick = () => startSelection(type);
+
+            const clearBtn = document.createElement('button');
+            clearBtn.innerText = "❌";
+            clearBtn.title = "Reset to Auto";
+            clearBtn.style.cssText = "background:#333; border:1px solid #555; color:white; border-radius:3px; cursor:pointer;";
+            clearBtn.onclick = () => {
+                GM_deleteValue(key);
+                updatePanel();
+            };
+
+            controls.appendChild(selBtn);
+            controls.appendChild(clearBtn);
+
+            const valDisplay = document.createElement('div');
+            valDisplay.id = `c-val-${type}`;
+            valDisplay.style.cssText = "font-size:9px; color:#666; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:200px;";
+            valDisplay.innerText = "Auto";
+
+            row.appendChild(lbl);
+            row.appendChild(controls);
+            row.appendChild(valDisplay);
+            return row;
+        };
+
+        uiPanel.appendChild(createRow("Prompt Input", CFG_PROMPT, 'prompt'));
+        uiPanel.appendChild(createRow("Generate Button", CFG_BTN, 'button'));
+
+        // Close / Help
+        const footer = document.createElement('div');
+        footer.style.cssText = "margin-top:5px; border-top:1px solid #444; padding-top:5px; font-size:10px; color:#888; text-align:center;";
+        footer.innerText = "Click 'Select' then click the element on page.";
+        uiPanel.appendChild(footer);
+
+        ui.appendChild(uiPanel);
         document.body.appendChild(ui);
+
+        updatePanel();
+    }
+
+    function toggleSettings() {
+        if (!uiPanel) return;
+        uiPanel.style.display = uiPanel.style.display === 'none' ? 'flex' : 'none';
+        if (uiPanel.style.display === 'flex') updatePanel();
+    }
+
+    function updatePanel() {
+        const pVal = GM_getValue(CFG_PROMPT);
+        const bVal = GM_getValue(CFG_BTN);
+
+        const pEl = document.getElementById(`c-val-prompt`);
+        if (pEl) {
+            pEl.innerText = pVal ? pVal : "Auto Detected";
+            pEl.style.color = pVal ? "#4CAF50" : "#666";
+        }
+
+        const bEl = document.getElementById(`c-val-button`);
+        if (bEl) {
+            bEl.innerText = bVal ? bVal : "Auto Detected";
+            bEl.style.color = bVal ? "#4CAF50" : "#666";
+        }
     }
 
     function updateStatus(text, color) {
-        if (!ui) createUI();
-        ui.innerHTML = `ComfyUI: <span style='color:${color}'>${text}</span>`;
+        const el = document.getElementById('c-status');
+        if (el) {
+            el.innerHTML = text;
+            el.style.color = color;
+        }
     }
+
+    // --- SELECTION LOGIC ---
+    function startSelection(type) {
+        if (selectionMode) stopSelection();
+        selectionMode = type;
+        updateStatus(`Select ${type === 'prompt' ? 'Input' : 'Button'}...`, "#00BFFF");
+
+        // Overlay styles
+        const style = document.createElement('style');
+        style.id = 'comfy-selection-style';
+        style.innerHTML = `* { cursor: crosshair !important; } .comfy-highlight { outline: 3px solid #ff00ff !important; box-shadow: 0 0 10px #ff00ff !important; }`;
+        document.head.appendChild(style);
+
+        document.addEventListener('mouseover', onHover, true);
+        document.addEventListener('click', onSelect, true);
+        document.addEventListener('keydown', onKey, true);
+    }
+
+    function stopSelection() {
+        selectionMode = null;
+        const style = document.getElementById('comfy-selection-style');
+        if (style) style.remove();
+
+        if (lastHovered) {
+            lastHovered.classList.remove('comfy-highlight');
+            lastHovered = null;
+        }
+
+        document.removeEventListener('mouseover', onHover, true);
+        document.removeEventListener('click', onSelect, true);
+        document.removeEventListener('keydown', onKey, true);
+
+        updateStatus("Idle", "#AAAAAA");
+    }
+
+    function onHover(e) {
+        if (!selectionMode) return;
+        if (ui && ui.contains(e.target)) return; // Don't select UI
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        if (lastHovered !== e.target) {
+            if (lastHovered) lastHovered.classList.remove('comfy-highlight');
+            lastHovered = e.target;
+            lastHovered.classList.add('comfy-highlight');
+        }
+    }
+
+    function onSelect(e) {
+        if (!selectionMode) return;
+        if (ui && ui.contains(e.target)) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        const selector = generateSelector(e.target);
+        const key = selectionMode === 'prompt' ? CFG_PROMPT : CFG_BTN;
+
+        GM_setValue(key, selector);
+        console.log(`[ComfyBridge] Saved selector for ${selectionMode}:`, selector);
+
+        // Visual confirmation
+        updateStatus("Saved!", "#00FF00");
+        stopSelection();
+        toggleSettings(); // Open settings to show result
+    }
+
+    function onKey(e) {
+        if (e.key === 'Escape') {
+            stopSelection();
+        }
+    }
+
+    function generateSelector(el) {
+        if (el.id) return `#${el.id}`;
+
+        let path = [];
+        while (el.parentElement) {
+            let tag = el.tagName.toLowerCase();
+            if (el === document.body) {
+                path.unshift('body');
+                break;
+            }
+
+            let sibling = el;
+            let nth = 1;
+            while (sibling = sibling.previousElementSibling) {
+                if (sibling.tagName.toLowerCase() === tag) nth++;
+            }
+
+            if (nth > 1) tag += `:nth-of-type(${nth})`;
+            path.unshift(tag);
+            el = el.parentElement;
+        }
+        return path.join(' > ');
+    }
+
 
     // --- NETWORK HELPER ---
     function gmRequest(url, method = "GET", data = null) {
@@ -76,7 +286,7 @@
                             const json = JSON.parse(response.responseText);
                             resolve(json);
                         } catch (e) {
-                            resolve(response.responseText); // Fallback for non-json
+                            resolve(response.responseText);
                         }
                     } else {
                         reject(new Error(`HTTP ${response.status}`));
@@ -93,43 +303,35 @@
         if (isProcessing) return;
 
         try {
-            // Use GM_xmlhttpRequest to bypass CSP/Mixed Content (HTTPS -> HTTP)
             const data = await gmRequest(`${SERVER_URL}/job`);
 
             if (data.job) {
-                isProcessing = true; // Local lock
+                isProcessing = true;
                 await executeJob(data.job);
             } else {
-                updateStatus("Connected (Idle)", "#AAAAAA");
-                // Clear state if server says IDLE
+                if (selectionMode === null) updateStatus("Connected (Idle)", "#AAAAAA");
                 if (GM_getValue('comfy_job_id')) {
                     GM_deleteValue('comfy_job_id');
                     GM_deleteValue('comfy_job_phase');
                 }
             }
         } catch (e) {
-            // console.warn("ComfyUI Bridge Poll Error:", e);
             updateStatus("Disconnected", "#FF4444");
         }
     }
 
     async function executeJob(job) {
-        // Try GM storage, fallback to window.name (robust against some storage clears)
         const storedId = GM_getValue('comfy_job_id') || (window.name.startsWith('comfy_job:') ? window.name.split(':')[1] : null);
         let phase = GM_getValue('comfy_job_phase') || 'start';
 
-        // Check if this is a Resume or New Job
         if (storedId === job.id) {
             console.log(`[ComfyBridge] Resuming Job ${job.id} at phase ${phase}`);
             updateStatus(`Resuming (${phase})...`, "#00FF00");
         } else {
-            console.log(`[ComfyBridge] Starting New Job ${job.id} (Old: ${storedId})`);
-
-            // Set persistence
+            console.log(`[ComfyBridge] Starting New Job ${job.id}`);
             GM_setValue('comfy_job_id', job.id);
             GM_setValue('comfy_job_phase', 'start');
-            try { window.name = `comfy_job:${job.id}`; } catch (e) { } // Backup
-
+            try { window.name = `comfy_job:${job.id}`; } catch (e) { }
             phase = 'start';
         }
 
@@ -140,22 +342,20 @@
 
                 let promptBox = findPromptBox(job.selectors);
                 if (!promptBox) {
-                    await sleep(2000); // Retry
+                    await sleep(2000);
                     promptBox = findPromptBox(job.selectors);
                 }
 
                 if (!promptBox) {
-                    // FALLBACK: If prompt box is missing, we might have reloaded into a result page 
-                    // where persistence failed. Instead of dying, let's try to wait for a result.
-                    console.warn("[ComfyBridge] Prompt box not found. Assuming we are already generating/waiting.");
+                    // Fallback to wait_result if we can't find prompt (maybe page reload happened and we lost context)
+                    console.warn("[ComfyBridge] Prompt box not found. Checking if we should wait for result...");
                     phase = 'wait_result';
                     GM_setValue('comfy_job_phase', phase);
                 } else {
-                    // Normal Flow
                     promptBox.focus();
                     promptBox.value = job.prompt;
                     promptBox.dispatchEvent(new Event('input', { bubbles: true }));
-                    if (promptBox.isContentEditable) promptBox.innerText = job.prompt;
+                    if (promptBox.getAttribute('contenteditable') === 'true') promptBox.innerText = job.prompt;
 
                     phase = 'generate';
                     GM_setValue('comfy_job_phase', phase);
@@ -169,47 +369,35 @@
 
                 let btn = findGenerateButton(job.selectors);
                 if (!btn) {
-                    console.warn("[ComfyBridge] Generate button not found. Skipping click.");
+                    console.warn("[ComfyBridge] Generate button not found.");
                 } else {
                     btn.click();
                 }
 
                 phase = 'wait_result';
                 GM_setValue('comfy_job_phase', phase);
-
-                // Wait for page reaction/reload
                 await sleep(3000);
             }
 
             // PHASE 3: WAIT Result
             if (phase === 'wait_result') {
                 updateStatus("Waiting for Image...", "#FFFF00");
-
-                // Capture baseline images
                 const currentImages = getImgSrcs();
 
-                // Wait for NEW image
                 let resultSrc = null;
                 try {
                     resultSrc = await waitForNewImage(currentImages, job.timeout || 60);
                 } catch (e) {
-                    // Timeout?
-                    // If we skipped phases, maybe the result is ALREADY there (last image)?
-                    // Heuristic: Try to grab the last robust image on the page
-                    console.warn("[ComfyBridge] Timeout waiting for NEW image. Checking for existing input...");
+                    // Fallback logic
+                    console.warn("[ComfyBridge] Timeout. Checking robust fallback...");
                     const allImgs = [...document.images].filter(i => i.naturalWidth > 200);
-                    if (allImgs.length > 0) {
-                        resultSrc = allImgs[allImgs.length - 1].src;
-                        console.log("[ComfyBridge] Falling back to last image:", resultSrc);
-                    } else {
-                        throw e;
-                    }
+                    if (allImgs.length > 0) resultSrc = allImgs[allImgs.length - 1].src;
+                    else throw e;
                 }
 
                 updateStatus("Uploading...", "#00FF00");
                 await sendResult(resultSrc);
 
-                // Cleanup
                 GM_deleteValue('comfy_job_id');
                 GM_deleteValue('comfy_job_phase');
                 updateStatus("Done!", "#00FF00");
@@ -218,17 +406,8 @@
         } catch (e) {
             console.error(e);
             updateStatus("Error: " + e.message, "#FF0000");
-
-            // Only report error to server if we are sure it's fatal
-            // e.g. Prompt box missing on start.
-            // If we are in wait state and something odd happens, maybe we shouldn't kill the server job immediately?
-            // For now, fail fast is safer.
-
-            // Wait a bit before reporting error, to avoid spamming if it's transient
             await sleep(1000);
             gmRequest(`${SERVER_URL}/result`, 'POST', { error: e.message }).catch(err => { });
-
-            // Clear local state so next poll doesn't infinite loop error
             GM_deleteValue('comfy_job_id');
             GM_deleteValue('comfy_job_phase');
         } finally {
@@ -236,11 +415,22 @@
         }
     }
 
-    // --- ACTIONS ---
+    // --- FINDERS ---
 
-    function findPromptBox(selectors) {
-        if (selectors && selectors.prompt) return document.querySelector(selectors.prompt);
+    function findPromptBox(serverSelectors) {
+        // 1. User Custom
+        const custom = GM_getValue(CFG_PROMPT);
+        if (custom) {
+            try {
+                const el = document.querySelector(custom);
+                if (el) return el;
+            } catch (e) { console.warn("Invalid custom selector", custom); }
+        }
 
+        // 2. Server Hint
+        if (serverSelectors && serverSelectors.prompt) return document.querySelector(serverSelectors.prompt);
+
+        // 3. Heuristics
         const candidates = [
             ...document.querySelectorAll('textarea'),
             ...document.querySelectorAll('div[contenteditable="true"]'),
@@ -253,17 +443,14 @@
 
         candidates.forEach(el => {
             if (el.offsetParent === null) return;
-
             let score = 0;
             const context = (el.id + el.className + el.getAttribute('placeholder') + el.getAttribute('aria-label')).toLowerCase();
 
             if (context.includes('prompt')) score += 10;
             if (context.includes('chat')) score += 5;
-            if (context.includes('ask')) score += 5; // Gemini uses "Ask Gemini"
+            if (context.includes('ask')) score += 5;
             if (el.tagName === 'TEXTAREA') score += 2;
             if (el.getAttribute('contenteditable') === 'true') score += 5;
-
-            // Heavily penalize search bars if we have other options
             if (context.includes('search')) score -= 2;
 
             if (score > bestScore) {
@@ -275,22 +462,29 @@
         return best;
     }
 
-    function findGenerateButton(selectors) {
-        if (selectors && selectors.submit) return document.querySelector(selectors.submit);
+    function findGenerateButton(serverSelectors) {
+        // 1. User Custom
+        const custom = GM_getValue(CFG_BTN);
+        if (custom) {
+            try {
+                const el = document.querySelector(custom);
+                if (el) return el;
+            } catch (e) { console.warn("Invalid custom selector", custom); }
+        }
 
+        // 2. Server Hint
+        if (serverSelectors && serverSelectors.submit) return document.querySelector(serverSelectors.submit);
+
+        // 3. Heuristics
         const keywords = ['generate', 'create', 'run', 'submit', 'send', 'dream'];
         const buttons = [...document.querySelectorAll('button'), ...document.querySelectorAll('input[type="submit"]'), ...document.querySelectorAll('div[role="button"]')];
 
         for (let btn of buttons) {
             if (btn.offsetParent === null) continue;
-
-            // Check Aria Label which is common in modern apps (like Gemini send button)
             const aria = (btn.getAttribute('aria-label') || "").toLowerCase();
             const txt = (btn.innerText + btn.value).toLowerCase();
 
             if (keywords.some(k => txt.includes(k) || aria.includes(k))) return btn;
-
-            // Special case: Material icons often have no text but specific classes or SVGs
             if (aria.includes('send') || aria.includes('submit')) return btn;
         }
         return null;
@@ -305,7 +499,6 @@
         while ((Date.now() - start) < timeoutSecs * 1000) {
             const currentImages = [...document.images];
             for (let img of currentImages) {
-                // Ignore small icons, avatars (often < 100px)
                 if (img.src && !oldImages.has(img.src) && img.naturalWidth > 200 && img.naturalHeight > 200) {
                     return img.src;
                 }
@@ -315,21 +508,16 @@
         throw new Error("Timeout waiting for image");
     }
 
+    // --- UTILS ---
     async function sendResult(src) {
-        // Convert to base64
-        console.log(`[ComfyBridge] Converting ${src} to DataURL...`);
         const dataUrl = await toDataURL(src);
-        console.log(`[ComfyBridge] DataURL generated. Length: ${dataUrl.length}. Header: ${dataUrl.substring(0, 50)}...`);
-
         await gmRequest(`${SERVER_URL}/result`, 'POST', { image: dataUrl });
     }
 
-    // --- UTILS ---
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
     async function toDataURL(url) {
         if (url.startsWith('data:')) return url;
-
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: "GET",
