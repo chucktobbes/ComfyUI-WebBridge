@@ -11,8 +11,8 @@ from PIL import Image
 
 # Global state to share between Node and Server Thread
 SERVER_STATE = {
-    "job": None,          # Current job: {"id": "...", "prompt": "...", "selectors": {...}}
-    "result": None,       # Result data: PIL Image or None
+    "job": None,          # Current job: {"id": "...", "prompt": "...", "mode": "image|text", "selectors": {...}}
+    "result": None,       # Result data: PIL Image, String, or None
     "status": "idle",     # idle, waiting_for_browser, processsing, complete
     "last_error": None,
     "event": threading.Event() # Event to wake up the node
@@ -59,16 +59,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                      print(f"[WebBridge] Client reported error: {data['error']}")
                      SERVER_STATE["last_error"] = data["error"]
                      SERVER_STATE["result"] = None
+                
+                elif "text" in data:
+                    print(f"[WebBridge] Received text data. Length: {len(data['text'])}")
+                    SERVER_STATE["result"] = {"type": "text", "data": data["text"]}
+
                 elif "image" in data:
                     b64_str = data["image"]
                     print(f"[WebBridge] Received image data. Length: {len(b64_str)}")
                     
                     if "," in b64_str:
                         header, encoded = b64_str.split(",", 1)
-                        print(f"[WebBridge] Image header: {header}")
                     else:
                         encoded = b64_str
-                        print(f"[WebBridge] No header found in base64 string.")
 
                     img_data = base64.b64decode(encoded)
                     img = Image.open(BytesIO(img_data))
@@ -77,7 +80,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     img.verify() 
                     img = Image.open(BytesIO(img_data)) # Re-open after verify
                     
-                    SERVER_STATE["result"] = img
+                    SERVER_STATE["result"] = {"type": "image", "data": img}
                     print("[WebBridge] Image decoded successfully.")
                 
                 SERVER_STATE["event"].set()
@@ -116,6 +119,7 @@ class WebFetchServerNode:
     def INPUT_TYPES(s):
         return {
             "required": {
+                "mode": (["Image", "Text"],),
                 "prompt": ("STRING", {"multiline": True, "dynamicPrompts": False}),
             },
             "optional": {
@@ -124,12 +128,12 @@ class WebFetchServerNode:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "text")
     FUNCTION = "process"
     CATEGORY = "WebFetch"
 
-    def process(self, prompt, timeout=60, selector_override_json="{}"):
+    def process(self, mode, prompt, timeout=60, selector_override_json="{}"):
         # 1. Reset State
         SERVER_STATE["event"].clear()
         SERVER_STATE["result"] = None
@@ -143,13 +147,14 @@ class WebFetchServerNode:
              
         SERVER_STATE["job"] = {
             "id": str(time.time()),
+            "mode": mode.lower(),
             "prompt": prompt,
             "timeout": timeout,
             "selectors": selectors
         }
         SERVER_STATE["status"] = "waiting_for_browser"
         
-        print(f"Job posted. Waiting for browser to fetch from http://localhost:{PORT}...")
+        print(f"Job posted ({mode}). Waiting for browser to fetch from http://localhost:{PORT}...")
         
         # 3. Wait
         start_time = time.time()
@@ -168,9 +173,24 @@ class WebFetchServerNode:
         if SERVER_STATE["result"] is None:
             raise Exception("Timeout: Browser did not send a result in time. Make sure the Userscript is running.")
             
-        # Convert PIL to Tensor
-        img = SERVER_STATE["result"].convert("RGB")
-        img = np.array(img).astype(np.float32) / 255.0
-        img = torch.from_numpy(img)[None,]
+        # 5. Return based on Type
+        res_type = SERVER_STATE["result"].get("type")
+        res_data = SERVER_STATE["result"].get("data")
         
-        return (img,)
+        # Default empty returns
+        empty_img = torch.zeros((1, 64, 64, 3), dtype=torch.float32, device="cpu")
+        empty_text = ""
+        
+        if res_type == "image":
+             # Convert PIL to Tensor
+            img = res_data.convert("RGB")
+            img = np.array(img).astype(np.float32) / 255.0
+            img = torch.from_numpy(img)[None,]
+            return (img, empty_text)
+            
+        elif res_type == "text":
+            return (empty_img, str(res_data))
+            
+        else:
+            print(f"Unknown result type: {res_type}")
+            return (empty_img, empty_text)

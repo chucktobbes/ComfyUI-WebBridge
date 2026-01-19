@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ComfyUI Web Fetch Bridge
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Connects any website to ComfyUI WebFetch Node
 // @author       You
 // @match        *://*/*
@@ -24,11 +24,12 @@
     const HOST = window.location.hostname;
     const CFG_PROMPT = `cfg_${HOST}_prompt`;
     const CFG_BTN = `cfg_${HOST}_btn`;
+    const CFG_TEXT_OUTPUT = `cfg_${HOST}_text_output`;
 
     let isProcessing = false;
     let ui = null;
     let uiPanel = null;
-    let selectionMode = null; // 'prompt' | 'button' | null
+    let selectionMode = null; // 'prompt' | 'button' | 'text' | null
     let lastHovered = null;
 
     // --- MENU COMMANDS ---
@@ -130,6 +131,7 @@
 
         uiPanel.appendChild(createRow("Prompt Input", CFG_PROMPT, 'prompt'));
         uiPanel.appendChild(createRow("Generate Button", CFG_BTN, 'button'));
+        uiPanel.appendChild(createRow("Text Output Area", CFG_TEXT_OUTPUT, 'text'));
 
         // Close / Help
         const footer = document.createElement('div');
@@ -152,18 +154,19 @@
     function updatePanel() {
         const pVal = GM_getValue(CFG_PROMPT);
         const bVal = GM_getValue(CFG_BTN);
+        const tVal = GM_getValue(CFG_TEXT_OUTPUT);
 
-        const pEl = document.getElementById(`c-val-prompt`);
-        if (pEl) {
-            pEl.innerText = pVal ? pVal : "Auto Detected";
-            pEl.style.color = pVal ? "#4CAF50" : "#666";
-        }
+        const updateLbl = (type, val) => {
+            const el = document.getElementById(`c-val-${type}`);
+            if (el) {
+                el.innerText = val ? val : "Auto Detected";
+                el.style.color = val ? "#4CAF50" : "#666";
+            }
+        };
 
-        const bEl = document.getElementById(`c-val-button`);
-        if (bEl) {
-            bEl.innerText = bVal ? bVal : "Auto Detected";
-            bEl.style.color = bVal ? "#4CAF50" : "#666";
-        }
+        updateLbl('prompt', pVal);
+        updateLbl('button', bVal);
+        updateLbl('text', tVal);
     }
 
     function updateStatus(text, color) {
@@ -178,7 +181,13 @@
     function startSelection(type) {
         if (selectionMode) stopSelection();
         selectionMode = type;
-        updateStatus(`Select ${type === 'prompt' ? 'Input' : 'Button'}...`, "#00BFFF");
+
+        let label = "Element";
+        if (type === 'prompt') label = "Input Box";
+        if (type === 'button') label = "Generate Button";
+        if (type === 'text') label = "Text Output Container";
+
+        updateStatus(`Select ${label}...`, "#00BFFF");
 
         // Overlay styles
         const style = document.createElement('style');
@@ -230,7 +239,11 @@
         e.stopPropagation();
 
         const selector = generateSelector(e.target);
-        const key = selectionMode === 'prompt' ? CFG_PROMPT : CFG_BTN;
+
+        let key;
+        if (selectionMode === 'prompt') key = CFG_PROMPT;
+        else if (selectionMode === 'button') key = CFG_BTN;
+        else if (selectionMode === 'text') key = CFG_TEXT_OUTPUT;
 
         GM_setValue(key, selector);
         console.log(`[ComfyBridge] Saved selector for ${selectionMode}:`, selector);
@@ -328,7 +341,7 @@
             console.log(`[ComfyBridge] Resuming Job ${job.id} at phase ${phase}`);
             updateStatus(`Resuming (${phase})...`, "#00FF00");
         } else {
-            console.log(`[ComfyBridge] Starting New Job ${job.id}`);
+            console.log(`[ComfyBridge] Starting New Job ${job.id} (${job.mode})`);
             GM_setValue('comfy_job_id', job.id);
             GM_setValue('comfy_job_phase', 'start');
             try { window.name = `comfy_job:${job.id}`; } catch (e) { }
@@ -347,7 +360,6 @@
                 }
 
                 if (!promptBox) {
-                    // Fallback to wait_result if we can't find prompt (maybe page reload happened and we lost context)
                     console.warn("[ComfyBridge] Prompt box not found. Checking if we should wait for result...");
                     phase = 'wait_result';
                     GM_setValue('comfy_job_phase', phase);
@@ -355,7 +367,11 @@
                     promptBox.focus();
                     promptBox.value = job.prompt;
                     promptBox.dispatchEvent(new Event('input', { bubbles: true }));
-                    if (promptBox.getAttribute('contenteditable') === 'true') promptBox.innerText = job.prompt;
+                    if (promptBox.getAttribute('contenteditable') === 'true') {
+                        promptBox.innerText = job.prompt;
+                        // Some complex editors need more events
+                        promptBox.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
 
                     phase = 'generate';
                     GM_setValue('comfy_job_phase', phase);
@@ -381,22 +397,33 @@
 
             // PHASE 3: WAIT Result
             if (phase === 'wait_result') {
-                updateStatus("Waiting for Image...", "#FFFF00");
-                const currentImages = getImgSrcs();
+                const mode = job.mode || 'image'; // Legacy default
 
-                let resultSrc = null;
-                try {
-                    resultSrc = await waitForNewImage(currentImages, job.timeout || 60);
-                } catch (e) {
-                    // Fallback logic
-                    console.warn("[ComfyBridge] Timeout. Checking robust fallback...");
-                    const allImgs = [...document.images].filter(i => i.naturalWidth > 200);
-                    if (allImgs.length > 0) resultSrc = allImgs[allImgs.length - 1].src;
-                    else throw e;
+                if (mode === 'text') {
+                    updateStatus("Waiting for Text...", "#FFFF00");
+                    const text = await waitForText(job.timeout || 60);
+
+                    updateStatus("Uploading Text...", "#00FF00");
+                    await gmRequest(`${SERVER_URL}/result`, 'POST', { text: text });
+
+                } else {
+                    // IMAGE MODE
+                    updateStatus("Waiting for Image...", "#FFFF00");
+                    const currentImages = getImgSrcs();
+
+                    let resultSrc = null;
+                    try {
+                        resultSrc = await waitForNewImage(currentImages, job.timeout || 60);
+                    } catch (e) {
+                        console.warn("[ComfyBridge] Timeout. Checking robust fallback...");
+                        const allImgs = [...document.images].filter(i => i.naturalWidth > 200);
+                        if (allImgs.length > 0) resultSrc = allImgs[allImgs.length - 1].src;
+                        else throw e;
+                    }
+
+                    updateStatus("Uploading Image...", "#00FF00");
+                    await sendImageResult(resultSrc);
                 }
-
-                updateStatus("Uploading...", "#00FF00");
-                await sendResult(resultSrc);
 
                 GM_deleteValue('comfy_job_id');
                 GM_deleteValue('comfy_job_phase');
@@ -508,8 +535,58 @@
         throw new Error("Timeout waiting for image");
     }
 
+    async function waitForText(timeoutSecs) {
+        // If user defined a text container, use it. Otherwise, assume full body scan logic (risky)
+        // or look for the "last" message bubble.
+        const custom = GM_getValue(CFG_TEXT_OUTPUT);
+        let container = custom ? document.querySelector(custom) : document.body;
+
+        if (!container) container = document.body;
+
+        console.log("[ComfyBridge] Waiting for text in:", container);
+
+        let lastText = container.innerText;
+        let stableCount = 0;
+        const start = Date.now();
+
+        // Heuristic: Wait until text changes, then wait until it STOPS changing.
+        let hasStarted = false;
+
+        while ((Date.now() - start) < timeoutSecs * 1000) {
+            const currentText = container.innerText;
+
+            if (currentText.length !== lastText.length) {
+                // It's changing!
+                hasStarted = true;
+                lastText = currentText;
+                stableCount = 0;
+            } else {
+                if (hasStarted) {
+                    stableCount++;
+                    // If stable for 2 seconds (4 x 500ms), assume done
+                    if (stableCount >= 4) {
+                        return lastText;
+                    }
+                } else {
+                    // If we haven't seen a change yet, maybe it's just slow to start?
+                    // Or maybe the container is ALREADY holding the answer?
+                    // For now, let's wait at least 5 seconds before giving up on "starting"
+                    if ((Date.now() - start) > 5000 && currentText.length > 50) {
+                        // Assume it was already there (instant response)
+                        return currentText;
+                    }
+                }
+            }
+            await sleep(500);
+        }
+
+        // Timeout
+        if (hasStarted) return lastText; // Return whatever we got
+        throw new Error("Timeout waiting for text generation");
+    }
+
     // --- UTILS ---
-    async function sendResult(src) {
+    async function sendImageResult(src) {
         const dataUrl = await toDataURL(src);
         await gmRequest(`${SERVER_URL}/result`, 'POST', { image: dataUrl });
     }
